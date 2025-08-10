@@ -309,16 +309,60 @@ class NetCDFManager:
         time_var = ds[Config.TIME_DIM]
         
         try:
-            # Try direct conversion first
-            dates = pd.to_datetime(time_var.values)
+            # First try xarray's built-in time decoding (should work now with decode_times=True)
+            if hasattr(time_var, 'to_pandas'):
+                dates = time_var.to_pandas()
+                if isinstance(dates, pd.DatetimeIndex):
+                    logging.info(f"Successfully parsed {len(dates)} time coordinates using xarray's built-in decoding")
+                    return dates
+                else:
+                    dates = pd.to_datetime(dates)
+            else:
+                # Fallback to direct conversion
+                dates = pd.to_datetime(time_var.values)
             
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Standard time parsing failed: {str(e)}, trying alternative methods")
             try:
-                # Try using xarray's time parsing
-                dates = pd.to_datetime(time_var.values, errors='coerce')
+                # Try parsing with different approaches
+                time_values = time_var.values
+                
+                # Check if time coordinate has attributes for proper interpretation
+                if hasattr(time_var, 'units') and time_var.units:
+                    logging.info(f"Time units found: {time_var.units}")
+                    # Let xarray handle units-based conversion
+                    dates = pd.to_datetime(time_var.values, errors='coerce')
+                else:
+                    # Try different interpretations
+                    logging.warning("No time units found, attempting various parsing methods")
+                    
+                    # Try as is first
+                    dates = pd.to_datetime(time_values, errors='coerce')
+                    
+                    # If that gives us 1970 dates, it's likely raw numeric values
+                    if len(dates) > 0 and dates[0].year == 1970:
+                        logging.warning("Detected 1970 dates - likely raw numeric time values")
+                        # Check if values look like months since a reference date
+                        if all(isinstance(v, (int, float, np.integer, np.floating)) for v in time_values[:5]):
+                            # Assume monthly data starting from 1901 (common for climate data)
+                            start_year = 1901
+                            months_since_start = time_values.astype(int)
+                            dates = pd.date_range(
+                                start=f'{start_year}-01-01', 
+                                periods=len(months_since_start), 
+                                freq='MS'  # Month start
+                            )
+                            logging.info(f"Interpreted as monthly data starting from {start_year}")
+                        else:
+                            raise ProcessingError("Could not interpret numeric time values")
                 
                 # Remove any NaT values
-                valid_dates = dates[~pd.isna(dates)]
+                if isinstance(dates, pd.DatetimeIndex):
+                    valid_dates = dates[~pd.isna(dates)]
+                else:
+                    dates_index = pd.DatetimeIndex(dates)
+                    valid_dates = dates_index[~pd.isna(dates_index)]
+                
                 if len(valid_dates) != len(dates):
                     n_invalid = len(dates) - len(valid_dates)
                     logging.warning(f"Removed {n_invalid} invalid time values")
@@ -330,7 +374,12 @@ class NetCDFManager:
         if len(dates) == 0:
             raise ProcessingError("No valid dates found in time coordinate")
         
-        return pd.DatetimeIndex(dates)
+        # Ensure we return a DatetimeIndex
+        if not isinstance(dates, pd.DatetimeIndex):
+            dates = pd.DatetimeIndex(dates)
+            
+        logging.info(f"Successfully parsed time coordinate: {len(dates)} dates from {dates[0]} to {dates[-1]}")
+        return dates
     
     def read_monthly_data(self) -> Dict:
         """Read all monthly data and organize by date - optimized for large files"""
@@ -358,7 +407,7 @@ class NetCDFManager:
                     pass
                 
                 # Open with Dask for lazy loading
-                with xr.open_dataset(nc_file, chunks=chunk_sizes, decode_times=False) as ds:
+                with xr.open_dataset(nc_file, chunks=chunk_sizes, decode_times=True) as ds:
                     
                     # Validate required variable
                     if Config.VARIABLE_NAME not in ds.data_vars:
